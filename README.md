@@ -27,8 +27,8 @@ See "BiHDM_example.ipynb".
 
 ```Python
 >>> import numpy as np
->>> from sklearn.datasets import load_digits
->>> from sklearn.model_selection import cross_val_score
+>>> from sklearn.base import clone
+>>> from sklearn.model_selection import cross_val_score, StratifiedKFold
 
 >>> from BiHDM import BiHDMClassifier
 
