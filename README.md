@@ -1,9 +1,6 @@
 # BiHDM_pytorch
  An unofficial pytorch implementation of the BiHDM model proposed by Yang et al. [1] for decoding emotion from multi-channel electroencephalogram (EEG) recordings, with scikit-learn compatibility.
 
-> **Warning** 
-> :exclamation: The Domain Adversarial Strategy as described in section II.C of [1] is not implemented - this will be added to the current implementation soon.
-
 > **Warning**
 > Please note this is not an official implementation, nor has been tested on the datasets used in the original studies. Due to different libraries and hyperparameters used in the implementation (and potentially implementation errors), there might be differences in the performance of this model to the ones as described in the papers. Please always examine the source code, make your own changes if necessary, and describe the actual implementation if you are using this model for an academic study. And please raise an issue if you found any implementation error in my code, thank you!
 
@@ -35,7 +32,7 @@ See "BiHDM_example.ipynb".
 
 >>> from BiHDM import BiHDMClassifier
 
->>> # Define 64 EEG channels using 10-20 standard
+>>> # Define 64 EEG channels using 10-20 standard (on a 64-channel BioSemi cap)
 >>> ch_names = ['Fp1', 'AF7', 'AF3', 'F1', 'F3', 'F5', 'F7', 'FT7', 'FC5', 'FC3', 'FC1', 
 >>>             'C1', 'C3', 'C5', 'T7', 'TP7', 'CP5', 'CP3', 'CP1', 'P1', 'P3', 'P5', 
 >>>             'P7', 'P9', 'PO7', 'PO3', 'O1', 'Iz', 'Oz', 'POz', 'Pz', 'CPz', 'Fpz', 
@@ -81,16 +78,38 @@ See "BiHDM_example.ipynb".
 >>>                     optimizer_kwargs=dict(momentum=0.9, weight_decay=0.95),
 >>>                     random_state=42, use_gpu=True, verbose=False)
 
->>> pipeline = Pipeline([
->>>     ('scaler', StandardScaler()),
->>>     ('BiHDM', clf)
->>> ])
-
+>>> # first let's test the model without performing the domain adversarial strategy
 >>> scores = cross_val_score(clf, X, y)
 >>> print(np.mean(scores))
 0.783
 >>> print(scores)
 [0.745 0.76  0.775 0.805 0.83 ]
+```
+
+Then let's test the model again, but this time with the domain adversarial strategy.
+
+```Python
+>>> def custom_cross_val_score(clf, X, y):
+>>>     cv = StratifiedKFold()
+>>>     scores = []
+>>>     for train_index, test_index in cv.split(X, y):
+>>>         cloned_clf = clone(clf)
+>>>         X_train = X[train_index]
+>>>         y_train = y[train_index]
+>>>         X_test = X[test_index]
+>>>         y_test = y[test_index]
+        
+>>>         # provide X_test for performing the domain adversarial strategy
+>>>         cloned_clf.fit(X_train, y_train, X_test=X_test)
+>>>         score = cloned_clf.score(X_test, y_test)
+>>>         scores.append(score)
+>>>     return np.array(scores)
+
+>>> scores_d = custom_cross_val_score(clf, X, y)
+>>> print(np.mean(scores_d))
+0.7870000000000001
+>>> print(scores_d)
+[0.795 0.78  0.835 0.85  0.675]
 ```
 
 # Acknowledgements

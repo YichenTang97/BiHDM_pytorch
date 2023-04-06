@@ -2,6 +2,7 @@ import torch
 import math
 import numpy as np
 import torch.nn as nn
+from torch.autograd import Function
 from torch.utils.data import DataLoader, TensorDataset
 from importlib import import_module
 
@@ -61,6 +62,27 @@ class LProjector(nn.Module):
         ws = torch.einsum('nk,snd->sdk', self.weight, x)
         return torch.add(self.act_func_(ws), self.bias)
 
+class GradReverse(Function):
+    """The gradient reversal function.
+    Forward propogation does not change input, while backward propogation 
+    reverses the gradients.
+
+    Implementation followed this forum answer: 
+    https://discuss.pytorch.org/t/solved-reverse-gradients-in-backward-pass/3589/4
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.view_as(x)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg()
+    
+
+class GRL(nn.Module):
+    def forward(self, x):
+        return GradReverse.apply(x)
 
 
 class BiHDM(nn.Module):
@@ -99,6 +121,11 @@ class BiHDM(nn.Module):
         'inner_product'. If custom function, it should take two torch.Tensor objects (s_left 
         and s_right of sizes L x N x d_stream) and return one torch.Tensor of size L x N x d_pair.
         Where L is the number of electrodes in a stream, N is the batch size.
+    output_domain: bool, optional (default=True)
+        If the domain adversarial strategy should be performed. If set to true, an extra domain
+        discrimination layer will be added in parallel to the class discrimination layer. The domain
+        predictions will be returned as the second element of a tuple together with the class predictions
+        in the forward method.
     rnn_stream_kwargs: dict, optional (default={})
         kwargs to feed into RNNs extracting electrodes' deep features.
     rnn_global_kwargs: dict, optional (default={})
@@ -112,7 +139,7 @@ class BiHDM(nn.Module):
 
     def __init__(self, lh_stream, rh_stream, lv_stream, rv_stream, n_classes,
                  d_input, d_stream=32, d_pair=32, d_global=32, d_out=16, k=6, a=0.01, 
-                 pairwise_operation='subtraction', 
+                 pairwise_operation='subtraction', output_domain=True,
                  rnn_stream_kwargs={}, rnn_global_kwargs={}):
         super(BiHDM, self).__init__()
 
@@ -130,6 +157,7 @@ class BiHDM(nn.Module):
         self.a = a
         self.n_classes = n_classes
         self.pairwise_operation = pairwise_operation
+        self.output_domain = output_domain
         self.rnn_stream_kwargs = rnn_stream_kwargs
         self.rnn_global_kwargs = rnn_global_kwargs
 
@@ -165,10 +193,16 @@ class BiHDM(nn.Module):
         self.map_v_ = nn.Parameter(torch.randn((d_out, d_global)), requires_grad=True)
 
         # Define the output layers.
-        self.out_ = nn.Sequential(
+        self.out_class_ = nn.Sequential(
             nn.Linear(d_out * k, n_classes, bias=True),
             nn.LogSoftmax(dim=-1)
         )
+        if self.output_domain:
+            self.out_domain_ = nn.Sequential(
+                GRL(),
+                nn.Linear(d_out * k, 2, bias=True),
+                nn.LogSoftmax(dim=-1)
+            )
 
         # Initialize the weights.
         with torch.no_grad():
@@ -197,7 +231,9 @@ class BiHDM(nn.Module):
         nn.init.xavier_uniform_(self.map_v_)
 
         # init output linear weights with xavier uniform and gain=1
-        nn.init.xavier_uniform_(self.out_[0].weight)
+        nn.init.xavier_uniform_(self.out_class_[0].weight)
+        if self.output_domain:
+            nn.init.xavier_uniform_(self.out_domain_[1].weight)
 
     def pairwise_subtraction(self, sl, sr):
         return sl - sr
@@ -223,8 +259,12 @@ class BiHDM(nn.Module):
 
         Returns
         -------
-        torch.Tensor
-            A tensor of shape (n_sample, n_classes) representing the class probabilities.
+        torch.Tensor or tuple
+            If self.output_domain is set to False, a tensor of shape (n_sample, n_classes) 
+            representing the class probabilities will be returned. Otherwise a tuple of size 2
+            will be returned where the first element contains the class probabilities, and the 
+            second element contains another tensor of shape (n_sample, 2) representing the domain
+            probabilities.
         '''
         # electrode deep representation (len(stream) x n_sample x d_stream)
         lhs, _ = self.rnn_lh_(x[:,self.lh_stream].permute(1,0,2))
@@ -248,8 +288,12 @@ class BiHDM(nn.Module):
         gh = torch.einsum('og,sgk->sok', self.map_h_, gh)
         gv = torch.einsum('og,sgk->sok', self.map_v_, gv)
         hv = gh + gv
+        hv = hv.flatten(start_dim=1)
 
-        return self.out_(hv.flatten(start_dim=1))
+        if self.output_domain:
+            return self.out_class_(hv), self.out_domain_(hv)
+        else:
+            return self.out_class_(hv)
 
 
 class BiHDMClassifier(BaseEstimator, ClassifierMixin):
@@ -288,14 +332,21 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         Keyword arguments for the stream RNN.
     rnn_global_kwargs : dict, optional (default={})
         Keyword arguments for the global RNN.
-    loss : str, optional (default='NLLLoss')
-        Type of loss function. It must be a string exactly equal to the name of a loss 
-        function in torch.nn module (e.g., 'MSELoss', 'CrossEntropyLoss', etc.), as you 
-        are importing the loss function. See `torch.nn` for available loss functions.
-    optimizer : str, optional (default='SGD')
-        Type of optimizer to use. It must be a string exactly equal to the name of an 
-        optimizer in torch.optim module (e.g., 'SGD', 'Adam', etc.), as you are importing the 
-        optimizer function. See `torch.optim` for available optimizers.
+    loss : str or nn.Module class - custom loss, optional (default='NLLLoss')
+        Type of loss function for the classifier. If is a string, it must be a string exactly 
+        equal to the name of a loss function in torch.nn module (e.g., 'MSELoss', 
+        'CrossEntropyLoss', etc.), as you are importing the loss function. See `torch.nn` for 
+        available loss functions. If is a custom loss, it must be a nn.Module class like NLLLoss.
+    domain_loss : str or nn.Module class - custom loss, optional (default='NLLLoss')
+        Type of loss function for the domain discriminator. If is a string, it must be a string 
+        exactly equal to the name of a loss function in torch.nn module (e.g., 'MSELoss', 
+        'CrossEntropyLoss', etc.), as you are importing the loss function. See `torch.nn` for 
+        available loss functions. If is a custom loss, it must be a nn.Module class like NLLLoss.
+    optimizer : str or optim.Optimizer class - custom optimizer, optional (default='SGD')
+        Type of optimizer to use. If is a string, it must be a string exactly equal to the name 
+        of an optimizer in torch.optim module (e.g., 'SGD', 'Adam', etc.), as you are importing 
+        the optimizer function. See `torch.optim` for available optimizers. If is a custom 
+        optimizer, it must be an optim.Optimizer class like SGD.
     lr : float, optional (default=0.003)
         Learning rate.
     epochs : int, optional (default=10)
@@ -304,6 +355,8 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         Batch size for training.
     loss_kwargs : dict, optional (default={})
         Keyword arguments for the loss function.
+    domain_loss_kwargs : dict, optional (default={})
+        Keyword arguments for the domain loss function.
     optimizer_kwargs : dict, optional (default={'momentum': 0.9, 'weight_decay': 0.95})
         Keyword arguments for the optimizer.
     random_state : int, optional (default=42)
@@ -341,14 +394,17 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         Loss function used for training.
     classes_ : ndarray of shape (n_classes,)
         Unique classes in the target variable.
+    domain_discrimination_ : bool
+        Either to perform domain adversarial strategy or not, inferred from the inputs to
+        the fit method.
     """
 
     def __init__(self, ch_names, lh_chs, rh_chs, lv_chs, rv_chs, 
                  d_stream=32, d_pair=32, d_global=32, d_out=16, 
                  k=6, a=0.01, pairwise_operation='subtraction', 
                  rnn_stream_kwargs={}, rnn_global_kwargs={}, 
-                 loss='NLLLoss', optimizer='SGD', lr=0.003,
-                 epochs=10, batch_size=200, loss_kwargs={}, 
+                 loss='NLLLoss', domain_loss='NLLLoss', optimizer='SGD', lr=0.003,
+                 epochs=10, batch_size=200, loss_kwargs={}, domain_loss_kwargs={}, 
                  optimizer_kwargs=dict(momentum=0.9, weight_decay=0.95),
                  random_state=42, use_gpu=True, verbose=True):
 
@@ -370,11 +426,13 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         self.rnn_global_kwargs = rnn_global_kwargs
 
         self.loss = loss
+        self.domain_loss = domain_loss
         self.optimizer = optimizer
         self.lr = lr
         self.epochs = epochs
         self.batch_size = batch_size
         self.loss_kwargs = loss_kwargs
+        self.domain_loss_kwargs = domain_loss_kwargs
         self.optimizer_kwargs = optimizer_kwargs
 
         self.random_state = random_state
@@ -394,7 +452,7 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
             dev = "cpu"
         self.device_ = torch.device(dev)
 
-    def fit(self, X, y):
+    def fit(self, X, y, X_test=None):
         '''
         Fit the BiHDMClassifier to the training data.
 
@@ -405,6 +463,11 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
             by calling numpy.reshape using C-like index order.
         y : array-like of shape (n_samples,)
             Target variable.
+        X_test : array-like of shape (n_test_samples, n_features), optional (default=None)
+            The test data for performing the domain adversarial strategy. If not provided, the 
+            classifier will be trained only with the class discriminator but not the domain 
+            discriminator. X_test will be internally reshaped to (n_test_samples, n_channels, 
+            n_features_per_channel) by calling numpy.reshape using C-like index order.
 
         Returns
         -------
@@ -413,6 +476,11 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         '''
         # Check that X and y have correct shape
         X, y = check_X_y(X, y)
+        if X_test is not None:
+            self.domain_discrimination_ = True
+            X_test = check_array(X_test)
+        else:
+            self.domain_discrimination_ = False
 
         # Get dimensions of the input data
         self.n_features_in_ = X.shape[1]
@@ -432,13 +500,17 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         X_ = np.reshape(X, [X.shape[0], self.n_channels_, self.n_features_per_ch_], order='C')
         X_ = torch.as_tensor(X_, dtype=torch.float).to(self.device_)
         y_ = torch.as_tensor(self.le_.transform(y), dtype=torch.int64).to(self.device_)
+        if self.domain_discrimination_:
+            X_test_ = np.reshape(X_test, [X_test.shape[0], self.n_channels_, self.n_features_per_ch_], order='C')
+            X_test_ = torch.as_tensor(X_test_, dtype=torch.float).to(self.device_)
+            n_tests = X_test_.size()[0]
 
         # Construct BiHDM
         self.bihdm_ = BiHDM(self.lh_stream_, self.rh_stream_, self.lv_stream_, self.rv_stream_, 
                             n_classes=self.n_classes_, d_input=self.n_features_per_ch_, 
                             d_stream=self.d_stream, d_pair=self.d_pair, 
                             d_global=self.d_global, d_out=self.d_out, k=self.k, a=self.a, 
-                            pairwise_operation=self.pairwise_operation, 
+                            pairwise_operation=self.pairwise_operation, output_domain=self.domain_discrimination_,
                             rnn_stream_kwargs=self.rnn_stream_kwargs, 
                             rnn_global_kwargs=self.rnn_global_kwargs)
         self.bihdm_.to(self.device_)
@@ -446,8 +518,11 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         # Setup training steps
         dataset = TensorDataset(X_, y_)
         loader = DataLoader(dataset, batch_size=self.batch_size)
-        loss_fn = getattr(import_module('torch.nn'), self.loss)(**self.loss_kwargs)
-        optimizer = getattr(import_module('torch.optim'), self.optimizer)
+        loss_fn = getattr(import_module('torch.nn'), self.loss)(**self.loss_kwargs) \
+            if type(self.loss) == str else self.loss(**self.loss_kwargs)
+        loss_domain = getattr(import_module('torch.nn'), self.domain_loss)(**self.domain_loss_kwargs) \
+            if type(self.domain_loss) == str else self.domain_loss(**self.domain_loss_kwargs)
+        optimizer = getattr(import_module('torch.optim'), self.optimizer) if type(self.optimizer) == str else self.optimizer
         optimizer = optimizer(self.bihdm_.parameters(), lr=self.lr, **self.optimizer_kwargs)
 
         # Iterate through epochs to train BiHDM
@@ -457,8 +532,17 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
             
             for i, (batch, labels) in enumerate(loader):
                 optimizer.zero_grad()
-                outputs = self.bihdm_.forward(batch)
-                loss = loss_fn(outputs, labels)
+                if self.domain_discrimination_:
+                    outputs, domains_train = self.bihdm_.forward(batch)
+                    _, domains_test = self.bihdm_.forward(X_test_)
+                    domains = torch.cat([domains_train, domains_test], dim=0)
+                    n_trains = labels.size()[0]
+                    domain_labels = torch.zeros(n_trains + n_tests, dtype=torch.int64).to(self.device_)
+                    domain_labels[n_trains:] = 1
+                    loss = loss_fn(outputs, labels) + loss_domain(domains, domain_labels)
+                else:
+                    outputs = self.bihdm_.forward(batch)
+                    loss = loss_fn(outputs, labels)
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item()
@@ -492,7 +576,9 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         X = np.reshape(X, [X.shape[0], self.n_channels_, self.n_features_per_ch_], order='C')
         X = torch.as_tensor(X, dtype=torch.float).to(self.device_)
 
-        return self.le_.inverse_transform(torch.argmax(self.bihdm_(X), dim=-1).to('cpu').detach().numpy())
+        pred = self.bihdm_(X)
+        pred = pred[0] if self.domain_discrimination_ else pred
+        return self.le_.inverse_transform(torch.argmax(pred, dim=-1).to('cpu').detach().numpy())
 
     def predict_proba(self, X):
         """Predict class probabilities for the given input samples.
@@ -515,4 +601,7 @@ class BiHDMClassifier(BaseEstimator, ClassifierMixin):
         X = np.reshape(X, [X.shape[0], self.n_channels_, self.n_features_per_ch_], order='C')
         X = torch.as_tensor(X, dtype=torch.float).to(self.device_)
 
-        return torch.exp(self.bihdm_(X)).to('cpu').detach().numpy()
+        pred = self.bihdm_(X)
+        pred = pred[0] if self.domain_discrimination_ else pred
+        return torch.exp(pred).to('cpu').detach().numpy()
+    
