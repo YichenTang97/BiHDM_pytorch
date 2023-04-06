@@ -1,5 +1,7 @@
 # BiHDM_pytorch
  An unofficial pytorch implementation of the BiHDM model proposed by Yang et al. [1] for decoding emotion from multi-channel electroencephalogram (EEG) recordings, with scikit-learn compatibility.
+ 
+ :warning: **The Domain Adversarial Strategy as described in section II.C of [1] is not implemented - this will be added to the current implementation soon.**
 
 ## Introduction
 
