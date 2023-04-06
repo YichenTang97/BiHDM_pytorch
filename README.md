@@ -73,8 +73,8 @@ See "BiHDM_example.ipynb".
 >>>                     d_stream=32, d_pair=32, d_global=32, d_out=16, 
 >>>                     k=6, a=0.01, pairwise_operation='subtraction', 
 >>>                     rnn_stream_kwargs={}, rnn_global_kwargs={}, 
->>>                     loss='NLLLoss', optimizer='SGD', lr=0.003,
->>>                     epochs=8, batch_size=200, loss_kwargs={}, 
+>>>                     loss='NLLLoss', domain_loss='NLLLoss', optimizer='SGD', lr=0.003,
+>>>                     epochs=8, batch_size=200, loss_kwargs={}, domain_loss_kwargs={}, 
 >>>                     optimizer_kwargs=dict(momentum=0.9, weight_decay=0.95),
 >>>                     random_state=42, use_gpu=True, verbose=False)
 
